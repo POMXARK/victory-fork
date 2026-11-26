@@ -87,9 +87,20 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_paging(parts, super::shader::view_heap_paged())
+}
+
+#[cfg(test)]
+pub(crate) fn lower_paged_for_test(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_paging(parts, true)
+}
+
+fn lower_with_paging(parts: &Parts, view_heap_paged: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut state = Lower::new(parts, &bad);
+        state.view_heap_paged = view_heap_paged;
+        match state.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -295,6 +306,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Remap `RootType::ResourceHeap` descriptor indices via `SLOT_VIEW_MAP`.
+    view_heap_paged: bool,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1589,6 +1602,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            view_heap_paged: false,
         }
     }
 
@@ -6568,7 +6582,7 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let (slot, _) = self.heap_index_raw(*load, *first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6667,10 +6681,10 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -6697,20 +6711,59 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let slot = self.s.m.bin(c, Bin::LShr, at, shift);
+        if !sampler && root == RootType::ResourceHeap && self.view_heap_paged {
+            Ok(self.remap_view_index(slot))
+        } else {
+            Ok(slot)
+        }
+    }
+
+    /// Remaps a virtual `ResourceHeap` descriptor index through `SLOT_VIEW_MAP`.
+    fn remap_view_index(&mut self, slot: V) -> V {
+        let c = self.cur;
+        let last = self.s.m.i32(super::shader::SLOT_VIEW_MAP_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let clamped = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(clamped, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, clamped, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEW_MAP);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        let (slot, root) = self.heap_index_raw(load, first, sampler)?;
+        if !sampler && root == RootType::ResourceHeap && self.view_heap_paged {
+            Ok(self.remap_view_index(slot))
+        } else {
+            Ok(slot)
+        }
+    }
+
+    fn heap_index_raw(&mut self, load: Site, first: u8, sampler: bool) -> Result<(V, RootType), Why> {
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -6737,7 +6790,7 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        Ok((self.s.m.bin(c, Bin::LShr, addr, shift), root))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -12041,5 +12094,64 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn paged_resource_heap_emits_valid_dxil_with_view_map_srv() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![root(RootType::ResourceHeap, 0, 0)],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, false, 32).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let parts = super::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let unpaged = super::lower_with_paging(&parts, false).unwrap();
+        assert!(!unpaged.root_srvs.contains(&crate::emit::shader::SLOT_VIEW_MAP));
+        let mut paged = super::lower_paged_for_test(&parts).unwrap();
+        assert!(paged.root_srvs.contains(&crate::emit::shader::SLOT_VIEW_MAP));
+        assert!(paged.root_srvs.contains(&crate::emit::shader::SLOT_STRIDES));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut paged.dxil).expect("DXIL validation failed for SLOT_VIEW_MAP");
+        }
     }
 }
